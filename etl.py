@@ -1,3 +1,7 @@
+from pyspark.sql.functions import monotonically_increasing_id as mon_id
+from pyspark.sql.functions import udf, col, lit, year, month, upper, to_date
+from pyspark.sql.types import DateType, StructType, StructField, StringType, IntegerType, TimestampType
+from pyspark.sql import SparkSession
 import configparser
 import os
 import sys
@@ -5,10 +9,10 @@ import logging
 
 import pandas as pd
 
-from pyspark.sql import SparkSession
-from pyspark.sql.types import DateType, StructType, StructField, StringType, IntegerType, TimestampType
-from pyspark.sql.functions import udf, col, lit, year, month, upper, to_date
-from pyspark.sql.functions import monotonically_increasing_id as mon_id
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-8-openjdk-amd64"
+os.environ["PATH"] = "/opt/conda/bin:/opt/spark-2.4.3-bin-hadoop2.7/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/jvm/java-8-openjdk-amd64/bin"
+os.environ["SPARK_HOME"] = "/opt/spark-2.4.3-bin-hadoop2.7"
+os.environ["HADOOP_HOME"] = "/opt/spark-2.4.3-bin-hadoop2.7"
 
 
 # setting up logging
@@ -20,8 +24,8 @@ logger = logging.getLogger()
 config = configparser.ConfigParser()
 config.read('variables.cfg', encoding='utf-8-sig')
 
-os.environ['AWS_ACCESS_KEY_ID'] = config['AWS']['aws_access_key_id']
-os.environ['AWS_SECRET_ACCESS_KEY'] = config['AWS']['aws_secret_access_key']
+os.environ['AWS_ACCESS_KEY_ID'] = config['AWS']['AWS_ACCESS_KEY_ID']
+os.environ['AWS_SECRET_ACCESS_KEY'] = config['AWS']['AWS_SECRET_ACCESS_KEY']
 SOURCE_S3_BUCKET = config['S3']['SOURCE_S3_BUCKET']
 DEST_S3_BUCKET = config['S3']['DEST_S3_BUCKET']
 
@@ -30,11 +34,27 @@ DEST_S3_BUCKET = config['S3']['DEST_S3_BUCKET']
 
 # create spark session
 def create_spark_session():
-    spark = SparkSession.builder.\
-        config("spark.jars.repositories", "https://repos.spark-packages.org/").\
-        config("spark.jars.packages", "saurfang:spark-sas7bdat:2.0.0-s_2.11").\
-        enableHiveSupport().getOrCreate()
-    return spark
+    """
+    Description: Creates spark session.
+
+    Returns:
+        spark session object
+    """
+
+    try:
+        AWS_ACCESS_KEY_ID = os.environ['AWS_ACCESS_KEY_ID']
+        AWS_SECRET_ACCESS_KEY = os.environ['AWS_SECRET_ACCESS_KEY']
+
+        spark = SparkSession.builder\
+            .config("spark.jars.packages",
+                    "saurfang:spark-sas7bdat:2.0.0-s_2.11")\
+            .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.7.0")\
+            .enableHiveSupport().getOrCreate()
+        logger.info("Spark session created")
+        return spark
+    except Exception as e:
+        logger.error("Error creating spark session: {}".format(e))
+        raise e
 
 
 def SAS_to_date(date):
@@ -53,7 +73,7 @@ def rename_columns(table, new_column_names):
 
 
 # process immigration data
-def process_immigration_data(spark, input_data, output_data):
+def process_immigration_data(spark, output_data):
     """
     Process immigration data to get fact and dimension tables
 
@@ -69,12 +89,9 @@ def process_immigration_data(spark, input_data, output_data):
     logging.info("Processing immigration data starting...")
 
     # read immigration data
-    ''' immigration_data = "../../data/18-83510-I94-Data-2016/*.sas7bdat"
-    df = spark.read.format('com.github.saurfang.sas.spark').load(
-        '../../data/18-83510-I94-Data-2016/i94_apr16_sub.sas7bdat') '''
-
-    immigration_data = os.path.join(input_data, "18-83510-I94-Data-2016/*.sas7bdat")
-    df = spark.read.format('com.github.saurfang.sas.spark').load(immigration_data)
+    immigration_data = "18-83510-I94-Data-2016/*.sas7bdat"
+    df = spark.read.format("com.github.saurfang.sas.spark").load(
+        immigration_data, forceLowercaseNames=True, inferLong=True)
 
     logging.info("Processing fact tables")
 
@@ -97,8 +114,8 @@ def process_immigration_data(spark, input_data, output_data):
         "departure_date", SAS_to_date_udf(col("departure_date")))
 
     # write fact_immigration table to parquet file partitioned by state and city
-    fact_immigration.write.mode("overwrite").partitionBy(
-        "state_code").parquet(path=output_data + 'fact_immigration')
+    fact_immigration.write.partitionBy('state_code', 'city_code').parquet(
+        os.path.join(output_data + "fact_immigration/"), mode='overwrite')
 
     logging.info("Processing dim_person_immigration tables")
 
@@ -133,7 +150,7 @@ def process_immigration_data(spark, input_data, output_data):
         path=output_data + "dim_airline_immigration")
 
 
-def process_label_description_data(spark, input_data, output_data):
+def process_label_description_data(spark, output_data):
     """ Parsing label desctiption file to get codes of country, city, state
 
         Arguments:
@@ -148,7 +165,7 @@ def process_label_description_data(spark, input_data, output_data):
     logging.info("Processing label description data starting...")
 
     # read label description data
-    label = os.path.join(input_data, "I94_SAS_Labels_Descriptions.SAS")
+    label = "I94_SAS_Labels_Descriptions.SAS"
     with open(label, "r") as f:
         contents = f.readlines()
 
@@ -160,26 +177,26 @@ def process_label_description_data(spark, input_data, output_data):
         spark.createDataFrame(country_codes.items(), ["code", "country"]).write.mode(
             "overwrite").parquet(path=output_data + "country_codes")
 
-        city_codes = {}
+        city_code = {}
         for cities in contents[303:962]:
             pair = cities.split('=')
             code, city = pair[0].strip("\t").strip().strip("'"), \
                 pair[1].strip("\t").strip().strip("'")
-            city_codes[code] = city
-        spark.createDataFrame(city_codes.items(), ["code", "city"]).write.mode(
-            "overwrite").parquet(path=output_data + "city_codes")
+            city_code[code] = city
+        spark.createDataFrame(city_code.items(), ["code", "city"]).write.mode(
+            "overwrite").parquet(path=output_data + "city_code")
 
-        state_codes = {}
+        state_code = {}
         for states in contents[982:1036]:
             pair = states.strip("=")
             code, state = pair[0].strip("\t").strip().strip("'"), \
                 pair[1].strip("\t").strip().strip("'")
-            state_codes[code] = state
-        spark.createDataFrame(state_codes.items(), ["code", "state"]).write.mode(
-            "overwrite").parquet(path=output_data + "state_codes")
+            state_code[code] = state
+        spark.createDataFrame(state_code.items(), ["code", "state"]).write.mode(
+            "overwrite").parquet(path=output_data + "state_code")
 
 
-def process_temperature_data(spark, input_data, output_data):
+def process_temperature_data(spark, output_data):
     """ Process temperature data to get dim_temperature table
 
         Arguments:
@@ -194,7 +211,7 @@ def process_temperature_data(spark, input_data, output_data):
     logging.info("Processing temperature data starting...")
 
     # read temperature data
-    temperature_data = os.path.join(input_data, "GlobalLandTemperaturesByCity.csv")
+    temperature_data = "GlobalLandTemperaturesByCity.csv"
     df = spark.read.format("csv").option(
         "header", "true").load(temperature_data)
 
@@ -219,7 +236,7 @@ def process_temperature_data(spark, input_data, output_data):
         path=output_data + "dim_temperature")
 
 
-def process_demography_data(spark, input_data, output_data):
+def process_demography_data(spark, output_data):
     """ Process demography data to get dim_demography table
 
         Arguments:
@@ -234,7 +251,7 @@ def process_demography_data(spark, input_data, output_data):
     logging.info("Processing demography data starting...")
 
     # read demography data
-    demography_data = os.path.join(input_data, "us-cities-demographics.csv")
+    demography_data = "us-cities-demographics.csv"
     df = spark.read.format("csv").option(
         "header", "true").load(demography_data)
 
@@ -272,13 +289,13 @@ def process_demography_data(spark, input_data, output_data):
 
 def main():
     spark = create_spark_session()
-    input_data = SOURCE_S3_BUCKET
-    output_data = DEST_S3_BUCKET
+    output_data = "s3a://udacity-spark-proj/output/"
+    # output_data = DEST_S3_BUCKET
 
-    process_immigration_data(spark, input_data, output_data)
-    process_label_description_data(spark, input_data, output_data)
-    process_temperature_data(spark, input_data, output_data)
-    process_demography_data(spark, input_data, output_data)
+    process_immigration_data(spark, output_data)
+    process_label_description_data(spark, output_data)
+    process_temperature_data(spark, output_data)
+    process_demography_data(spark, output_data)
 
     logging.info("Processing data finished.")
 
